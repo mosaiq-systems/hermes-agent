@@ -44,6 +44,7 @@ logger = logging.getLogger(__name__)
 
 KANBAN_LIST_DEFAULT_LIMIT = 50
 KANBAN_LIST_MAX_LIMIT = 200
+SOFTWARE_ENGINEER_PROFILE = "software-engineer"
 
 
 def _profile_has_kanban_toolset() -> bool:
@@ -88,6 +89,21 @@ def _check_kanban_orchestrator_mode() -> bool:
     if os.environ.get("HERMES_KANBAN_TASK"):
         return False
     return _profile_has_kanban_toolset()
+
+
+def _check_kanban_graph_mode() -> bool:
+    """Graph mutation tools are visible only to orchestrators or software-engineer.
+
+    All dispatcher-spawned workers need lifecycle tools, but only the
+    software-engineer decomposition role should be able to create child cards
+    or mutate dependency edges from inside a worker run. Orchestrator profiles
+    with the kanban toolset still see these tools outside task scope.
+    """
+    if not _check_kanban_mode():
+        return False
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return True
+    return (os.environ.get("HERMES_PROFILE") or "").strip() == SOFTWARE_ENGINEER_PROFILE
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +236,29 @@ def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
             "kanban_comment for their assigned task."
         )
     return None
+
+
+def _require_software_engineer_graph_tool(tool_name: str) -> Optional[str]:
+    """Restrict worker-side graph mutation to software-engineer.
+
+    Orchestrator contexts (no ``HERMES_KANBAN_TASK``) remain able to route
+    board work. Dispatcher-scoped workers, however, must not grow or rewire
+    the DAG unless they are the implementation decomposition role. This is
+    the hard runtime counterpart to the Mosaiq full-pipeline contract: normal
+    workers comment/block/complete; software-engineer creates the parallel
+    implementation fanout and join structure.
+    """
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return None
+    profile = (os.environ.get("HERMES_PROFILE") or "").strip()
+    if profile == SOFTWARE_ENGINEER_PROFILE:
+        return None
+    return tool_error(
+        f"{tool_name} is restricted to the {SOFTWARE_ENGINEER_PROFILE} "
+        "decomposition role for dispatcher-spawned workers. This worker "
+        f"is {profile or 'unknown'}; add a kanban_comment or kanban_block "
+        "instead of spawning or rewiring child tasks."
+    )
 
 
 def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
@@ -637,11 +676,15 @@ def _handle_comment(args: dict, **kw) -> str:
 
 
 def _handle_create(args: dict, **kw) -> str:
-    """Create a child task. Orchestrator workers use this to fan out.
+    """Create a child task. Software-engineer workers use this to fan out.
 
     ``parents`` can be a list of task ids; dependency-gated promotion
-    works as usual.
+    works as usual. Dispatcher-scoped non-software-engineer workers are
+    denied by policy and should comment/block instead of growing the graph.
     """
+    guard = _require_software_engineer_graph_tool("kanban_create")
+    if guard:
+        return guard
     title = args.get("title")
     if not title or not str(title).strip():
         return tool_error("title is required")
@@ -750,6 +793,9 @@ def _handle_unblock(args: dict, **kw) -> str:
 
 def _handle_link(args: dict, **kw) -> str:
     """Add a parent→child dependency edge after the fact."""
+    guard = _require_software_engineer_graph_tool("kanban_link")
+    if guard:
+        return guard
     parent_id = args.get("parent_id")
     child_id = args.get("child_id")
     if not parent_id or not child_id:
@@ -1048,11 +1094,10 @@ KANBAN_CREATE_SCHEMA = {
     "name": "kanban_create",
     "description": (
         "Create a new kanban task, optionally as a child of the current "
-        "one (pass the current task id in ``parents``). Used by "
-        "orchestrator workers to fan out — decompose work into child "
-        "tasks with specific assignees, link them into a pipeline, "
-        "then complete your own task. The dispatcher picks up the new "
-        "tasks on its next tick and spawns the assigned profiles."
+        "one (pass the current task id in ``parents``). Orchestrators can "
+        "route board work outside task scope. In dispatcher worker mode, "
+        "only the software-engineer decomposition role may create child "
+        "tasks; other workers should add a comment or block instead."
     ),
     "parameters": {
         "type": "object",
@@ -1197,7 +1242,8 @@ KANBAN_LINK_SCHEMA = {
     "description": (
         "Add a parent→child dependency edge after both tasks already "
         "exist. The child won't promote to 'ready' until all parents "
-        "are 'done'. Cycles and self-links are rejected."
+        "are 'done'. Cycles and self-links are rejected. In dispatcher "
+        "worker mode, only software-engineer may mutate dependency topology."
     ),
     "parameters": {
         "type": "object",
@@ -1274,7 +1320,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_CREATE_SCHEMA,
     handler=_handle_create,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_kanban_graph_mode,
     emoji="➕",
 )
 
@@ -1292,6 +1338,6 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_LINK_SCHEMA,
     handler=_handle_link,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_kanban_graph_mode,
     emoji="🔗",
 )
