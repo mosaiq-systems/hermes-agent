@@ -2,7 +2,7 @@ name: Tests
 
 on:
   push:
-    branches: [main]
+    branches: [main, ethie/faster-tests-fake-main]
     paths-ignore:
       - '**/*.md'
       - 'docs/**'
@@ -23,10 +23,26 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      # Main: single unsliced job (generates duration cache for PRs).
+      # PRs: 4 sliced jobs for parallel wall-time reduction.
+      matrix:
+        slice: ${{ (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ethie/faster-tests-fake-main') && fromJSON('[0]') || fromJSON('[1, 2, 3, 4]') }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@de4c4f6da6dc9a6f5a8c9612df7944e3ba385e88  # v7.0.0
+
+      - name: Restore duration cache
+        uses: actions/cache/restore@5c4e3e6ac7067c0274b6f5d5ab0c8e6fc7a0d2a3  # v4.2.0
+        with:
+          path: .test_durations.json
+          key: test-durations-${{ github.sha }}
+          # Any previous cache from any branch works — caches from main
+          # are visible to all PRs; branch caches are visible to PRs
+          # targeting that branch.
+          restore-keys: test-durations-
 
       - name: Install ripgrep (prebuilt binary)
         run: |
@@ -72,21 +88,40 @@ jobs:
         # state across files, which is exactly the leakage we wanted to
         # fix. ThreadPoolExecutor + subprocess.run is ~60 lines and does
         # the job with cleaner semantics.
+        #
+        # Matrix slicing (--slice I/N): on PRs, files are distributed
+        # across 4 jobs by cached duration (LPT algorithm) so each job
+        # gets roughly equal wall time. Without a cache (e.g. first PR
+        # after this feature lands), files default to 2s estimate and
+        # get split roughly evenly by count — still correct, just not
+        # perfectly balanced. On main, a single unsliced job runs the
+        # full suite and saves the duration cache for future PRs.
         run: |
           source .venv/bin/activate
-          python scripts/run_tests_parallel.py
+          if [ "${{ matrix.slice }}" = "0" ]; then
+            python scripts/run_tests_parallel.py
+          else
+            python scripts/run_tests_parallel.py --slice ${{ matrix.slice }}/4
+          fi
         env:
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
 
+      - name: Save duration cache
+        if: matrix.slice == 0
+        uses: actions/cache/save@5c4e3e6ac7067c0274b6f5d5ab0c8e6fc7a0d2a3  # v4.2.0
+        with:
+          path: .test_durations.json
+          key: test-durations-${{ github.sha }}
+
   e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@de4c4f6da6dc9a6f5a8c9612df7944e3ba385e88  # v7.0.0
 
       - name: Install ripgrep (prebuilt binary)
         run: |
