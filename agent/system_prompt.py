@@ -31,6 +31,7 @@ from agent.prompt_builder import (
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
     KANBAN_GUIDANCE,
+    KNOWLEDGE_SOURCE_PRIORITY_GUIDANCE,
     MEMORY_GUIDANCE,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
     PLATFORM_HINTS,
@@ -98,7 +99,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # Fallback to hardcoded identity
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
 
-    # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
+    # Internal-knowledge-first source routing. This comes before the public
+    # Hermes docs pointer so local/user-specific knowledge constrains when
+    # external docs are appropriate.
+    stable_parts.append(KNOWLEDGE_SOURCE_PRIORITY_GUIDANCE)
+
+    # Pointer to the hermes-agent skill + docs for user questions about upstream Hermes itself.
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
 
     # Universal task-completion / no-fabrication guidance.  Applied to ALL

@@ -129,15 +129,28 @@ DEFAULT_AGENT_IDENTITY = (
     "Be targeted and efficient in your exploration and investigations."
 )
 
+KNOWLEDGE_SOURCE_PRIORITY_GUIDANCE = (
+    "# Knowledge source priority\n"
+    "Internal knowledge first for user-specific, project-specific, or local deployment "
+    "questions. For Mosaiq/Hermes deployment facts, prior decisions, endpoint/proxy/auth "
+    "details, Kanban/profile behavior, architecture, and memory infrastructure, check "
+    "available internal sources before external web/docs: built-in memory/user profile, "
+    "relevant skills and their references, Obsidian/Keep, Honcho, session_search, and "
+    "local files/config. External web/docs are a last resort after internal sources are "
+    "checked, or when the user explicitly asks for public/current upstream information. "
+    "Hermes docs are authoritative for upstream Hermes Agent behavior, but they are not "
+    "authoritative for this user's local Mosaiq deployment state."
+)
+
 HERMES_AGENT_HELP_GUIDANCE = (
     "You run on Hermes Agent (by Nous Research). When the user needs help with "
-    "Hermes itself — configuring, setting up, using, extending, or troubleshooting "
-    "it — or when you need to understand your own features, tools, or capabilities, "
-    "the documentation at https://hermes-agent.nousresearch.com/docs is your "
-    "authoritative reference and always holds the latest, most up-to-date "
-    "information. Load the `hermes-agent` skill with skill_view(name='hermes-agent') "
-    "for additional guidance and proven workflows, but treat the docs as the source "
-    "of truth when the two differ."
+    "upstream Hermes itself — configuring, setting up, using, extending, or troubleshooting "
+    "general Hermes Agent behavior — the documentation at "
+    "https://hermes-agent.nousresearch.com/docs is the authoritative public reference "
+    "and holds the latest upstream information. Load the `hermes-agent` skill with "
+    "skill_view(name='hermes-agent') first for local guidance and proven workflows. "
+    "For user-specific, Mosaiq-specific, or local deployment facts, follow the internal "
+    "knowledge-first policy instead of defaulting to public docs."
 )
 
 MEMORY_GUIDANCE = (

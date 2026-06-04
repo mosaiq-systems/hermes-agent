@@ -29,6 +29,10 @@ from agent.display import (
     _detect_tool_failure,
 )
 from agent.tool_guardrails import ToolGuardrailDecision
+from agent.source_priority_guardrail import (
+    evaluate_source_priority,
+    source_priority_block_result,
+)
 from agent.tool_dispatch_helpers import (
     _is_destructive_command,
     _is_multimodal_tool_result,
@@ -270,22 +274,13 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 error_message=_ts_scope_block,
             )
         else:
-            try:
-                from hermes_cli.plugins import get_pre_tool_call_block_message
-                block_message = get_pre_tool_call_block_message(
-                    function_name,
-                    function_args,
-                    task_id=effective_task_id or "",
-                    session_id=getattr(agent, "session_id", "") or "",
-                    tool_call_id=getattr(tool_call, "id", "") or "",
-                    turn_id=getattr(agent, "_current_turn_id", "") or "",
-                    api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                )
-            except Exception:
-                block_message = None
-
-            if block_message is not None:
-                block_result = json.dumps({"error": block_message}, ensure_ascii=False)
+            source_decision = evaluate_source_priority(
+                function_name,
+                function_args,
+                messages=messages,
+            )
+            if source_decision.blocked:
+                block_result = source_priority_block_result(source_decision)
                 _emit_terminal_post_tool_call(
                     agent,
                     function_name=function_name,
@@ -294,14 +289,26 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     effective_task_id=effective_task_id,
                     tool_call_id=getattr(tool_call, "id", "") or "",
                     status="blocked",
-                    error_type="plugin_block",
-                    error_message=block_message,
+                    error_type="source_priority_block",
+                    error_message=source_decision.message,
                 )
             else:
-                guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
-                if not guardrail_decision.allows_execution:
-                    block_result = agent._guardrail_block_result(guardrail_decision)
-                    blocked_by_guardrail = True
+                try:
+                    from hermes_cli.plugins import get_pre_tool_call_block_message
+                    block_message = get_pre_tool_call_block_message(
+                        function_name,
+                        function_args,
+                        task_id=effective_task_id or "",
+                        session_id=getattr(agent, "session_id", "") or "",
+                        tool_call_id=getattr(tool_call, "id", "") or "",
+                        turn_id=getattr(agent, "_current_turn_id", "") or "",
+                        api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                    )
+                except Exception:
+                    block_message = None
+
+                if block_message is not None:
+                    block_result = json.dumps({"error": block_message}, ensure_ascii=False)
                     _emit_terminal_post_tool_call(
                         agent,
                         function_name=function_name,
@@ -310,9 +317,25 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         effective_task_id=effective_task_id,
                         tool_call_id=getattr(tool_call, "id", "") or "",
                         status="blocked",
-                        error_type="guardrail_block",
-                        error_message=getattr(guardrail_decision, "message", None) or "Tool blocked by guardrail policy",
+                        error_type="plugin_block",
+                        error_message=block_message,
                     )
+                else:
+                    guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
+                    if not guardrail_decision.allows_execution:
+                        block_result = agent._guardrail_block_result(guardrail_decision)
+                        blocked_by_guardrail = True
+                        _emit_terminal_post_tool_call(
+                            agent,
+                            function_name=function_name,
+                            function_args=function_args,
+                            result=block_result,
+                            effective_task_id=effective_task_id,
+                            tool_call_id=getattr(tool_call, "id", "") or "",
+                            status="blocked",
+                            error_type="guardrail_block",
+                            error_message=getattr(guardrail_decision, "message", None) or "Tool blocked by guardrail policy",
+                        )
 
         # ── Checkpoint preflight (only for tools that will execute) ──
         if block_result is None:
@@ -738,26 +761,37 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         except Exception:
             pass
 
-        # Check plugin hooks for a block directive before executing.
+        # Check source-priority and plugin hooks for a block directive before executing.
         _block_msg: Optional[str] = None
         _block_error_type = "plugin_block"
+        _block_result_override: Optional[str] = None
         if _ts_scope_block is not None:
             _block_msg = _ts_scope_block
             _block_error_type = "tool_scope_block"
         else:
-            try:
-                from hermes_cli.plugins import get_pre_tool_call_block_message
-                _block_msg = get_pre_tool_call_block_message(
-                    function_name,
-                    function_args,
-                    task_id=effective_task_id or "",
-                    session_id=getattr(agent, "session_id", "") or "",
-                    tool_call_id=getattr(tool_call, "id", "") or "",
-                    turn_id=getattr(agent, "_current_turn_id", "") or "",
-                    api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                )
-            except Exception:
-                pass
+            source_decision = evaluate_source_priority(
+                function_name,
+                function_args,
+                messages=messages,
+            )
+            if source_decision.blocked:
+                _block_msg = source_decision.message
+                _block_error_type = "source_priority_block"
+                _block_result_override = source_priority_block_result(source_decision)
+            else:
+                try:
+                    from hermes_cli.plugins import get_pre_tool_call_block_message
+                    _block_msg = get_pre_tool_call_block_message(
+                        function_name,
+                        function_args,
+                        task_id=effective_task_id or "",
+                        session_id=getattr(agent, "session_id", "") or "",
+                        tool_call_id=getattr(tool_call, "id", "") or "",
+                        turn_id=getattr(agent, "_current_turn_id", "") or "",
+                        api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                    )
+                except Exception:
+                    pass
 
         _guardrail_block_decision: ToolGuardrailDecision | None = None
         if _block_msg is None:
@@ -840,8 +874,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         tool_start_time = time.time()
 
         if _block_msg is not None:
-            # Tool blocked by plugin policy — return error without executing.
-            function_result = json.dumps({"error": _block_msg}, ensure_ascii=False)
+            # Tool blocked by plugin/source-priority policy — return error without executing.
+            function_result = _block_result_override or json.dumps({"error": _block_msg}, ensure_ascii=False)
             tool_duration = 0.0
             _emit_terminal_post_tool_call(
                 agent,

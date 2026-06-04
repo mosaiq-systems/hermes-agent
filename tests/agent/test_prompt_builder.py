@@ -23,6 +23,7 @@ from agent.prompt_builder import (
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
+    KNOWLEDGE_SOURCE_PRIORITY_GUIDANCE,
     MEMORY_GUIDANCE,
     SESSION_SEARCH_GUIDANCE,
     PLATFORM_HINTS,
@@ -37,6 +38,12 @@ from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatu
 
 
 class TestGuidanceConstants:
+    def test_knowledge_source_priority_requires_internal_sources_before_external_web(self):
+        assert "Internal knowledge first" in KNOWLEDGE_SOURCE_PRIORITY_GUIDANCE
+        assert "External web/docs are a last resort" in KNOWLEDGE_SOURCE_PRIORITY_GUIDANCE
+        assert "Mosaiq" in KNOWLEDGE_SOURCE_PRIORITY_GUIDANCE
+        assert "Hermes docs are authoritative for upstream" in KNOWLEDGE_SOURCE_PRIORITY_GUIDANCE
+
     def test_memory_guidance_discourages_task_logs(self):
         assert "durable facts" in MEMORY_GUIDANCE
         assert "Do NOT save task progress" in MEMORY_GUIDANCE
