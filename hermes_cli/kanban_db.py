@@ -83,6 +83,11 @@ import sys
 import threading
 import logging
 import time
+try:
+    import fcntl  # POSIX dispatch coordination across gateway + cron
+except Exception:  # pragma: no cover - Windows / exotic platforms
+    fcntl = None  # type: ignore[assignment]
+from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -4312,6 +4317,14 @@ class DispatchResult:
     ``"recent_success"`` (completed run within guard window),
     ``"active_pr"`` (GitHub PR URL in a recent comment)."""
 
+    contract_blocked: list[tuple[str, str]] = field(default_factory=list)
+    """Tasks blocked or dry-run skipped because they violate the configured
+    pipeline contract. Each entry is ``(task_id, reason)``."""
+
+    dispatch_lock_busy: bool = False
+    """True when another dispatcher process already owns the per-board
+    dispatch lock. This is normal with coordinated gateway+cron dispatchers."""
+
 
 # Bounded registry of recently-reaped worker child exits, populated by the
 # reap loop at the top of ``dispatch_once`` and consulted by
@@ -5338,6 +5351,210 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     return False
 
 
+
+def _connection_db_path(conn: sqlite3.Connection) -> Optional[Path]:
+    """Return the main SQLite database path for ``conn`` when available."""
+    try:
+        row = conn.execute("PRAGMA database_list").fetchone()
+        if row is None:
+            return None
+        # sqlite3.Row supports both index and name access; tuple rows do too by index.
+        file_value = row["file"] if isinstance(row, sqlite3.Row) else row[2]
+        if not file_value:
+            return None
+        return Path(str(file_value)).expanduser().resolve()
+    except Exception:
+        return None
+
+
+@contextlib.contextmanager
+def _dispatch_coordination_lock(conn: sqlite3.Connection):
+    """Coordinate gateway + cron dispatchers with one non-blocking file lock.
+
+    SQLite CAS protects a single task claim, but dispatch_once also performs
+    reclaim/promote/crash-detect passes. Running those passes concurrently from
+    the gateway and cron dispatchers contributed to kanban.db corruption in the
+    Mosaiq fleet. A per-board advisory lock keeps both dispatchers enabled while
+    guaranteeing only one full dispatch tick mutates a board at a time.
+    """
+    if fcntl is None:
+        yield True
+        return
+    db_path = _connection_db_path(conn)
+    if db_path is None:
+        yield True
+        return
+    lock_path = db_path.with_suffix(db_path.suffix + ".dispatch.lock")
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(lock_path, "a+") as lock_fh:
+            try:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                yield False
+                return
+            try:
+                lock_fh.seek(0)
+                lock_fh.truncate()
+                lock_fh.write(f"pid={os.getpid()} acquired_at={int(time.time())}\n")
+                lock_fh.flush()
+                yield True
+            finally:
+                try:
+                    fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+    except OSError:
+        # If the lock path cannot be created, preserve availability rather
+        # than making every dispatcher tick fail. SQLite still provides the
+        # older per-write protection; telemetry will not show lock coordination.
+        yield True
+
+
+def _pipeline_contracts_path() -> Path:
+    override = os.environ.get("HERMES_PIPELINE_CONTRACTS", "").strip()
+    if override:
+        return Path(override).expanduser()
+    return kanban_home() / "scripts" / "contract" / "pipeline-contracts.json"
+
+
+def _load_pipeline_contracts() -> Optional[dict[str, Any]]:
+    path = _pipeline_contracts_path()
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        _log.warning("kanban dispatch: failed to load pipeline contracts from %s", path, exc_info=True)
+        return None
+
+
+def _task_parent_rows(conn: sqlite3.Connection, task_id: str) -> list[sqlite3.Row]:
+    return list(conn.execute(
+        "SELECT p.id, p.assignee, p.status, p.title "
+        "FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+        "WHERE l.child_id = ?",
+        (task_id,),
+    ).fetchall())
+
+
+def _task_text_for_contract(row: sqlite3.Row) -> str:
+    parts: list[str] = []
+    for key in ("title", "body", "description"):
+        try:
+            value = row[key]
+        except Exception:
+            value = None
+        if value:
+            parts.append(str(value))
+    return "\n".join(parts).casefold()
+
+
+def _matches_contract_override(
+    task_row: sqlite3.Row,
+    parents: list[sqlite3.Row],
+    contracts: dict[str, Any],
+) -> Optional[str]:
+    """Return override name when a narrow non-chain route is explicitly allowed."""
+    assignee = task_row["assignee"]
+    if assignee != "pm":
+        return None
+    text = _task_text_for_contract(task_row)
+    markers = ("senior_coder_failed", "senior-coder-failed", "senior coder failed")
+    if not any(marker in text for marker in markers):
+        return None
+    parent_roles = {p["assignee"] for p in parents if p["assignee"]}
+    if parent_roles and parent_roles.issubset({"software-engineer"}):
+        override = (contracts.get("_overrides") or {}).get("senior_coder_failed_to_pm")
+        if override:
+            return "senior_coder_failed_to_pm"
+    return None
+
+
+def check_pipeline_contract_for_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> tuple[bool, str]:
+    """Mechanical dispatch gate for pipeline role contracts.
+
+    Returns ``(True, 'pass')`` when the task is allowed to spawn. If no
+    contracts file exists, returns pass for backwards compatibility. When a
+    contracts file exists, unknown roles or invalid parent/creator chains fail
+    closed and are blocked before worker spawn.
+    """
+    contracts = _load_pipeline_contracts()
+    if not contracts:
+        return True, "no_contracts_configured"
+    task = conn.execute(
+        "SELECT id, title, body, assignee, created_by FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if task is None:
+        return False, "task_not_found"
+    assignee = task["assignee"]
+    if not assignee:
+        return False, "missing_assignee"
+    spec = contracts.get(assignee)
+    if not isinstance(spec, dict):
+        return False, f"no_contract_for_assignee:{assignee}"
+    parents = _task_parent_rows(conn, task_id)
+    allowed_parents = set(spec.get("allowed_parents") or [])
+    allowed_creators = set(spec.get("allowed_creators") or [])
+    if parents:
+        override = _matches_contract_override(task, parents, contracts)
+        if override:
+            return True, f"override:{override}"
+        parent_roles = [p["assignee"] for p in parents]
+        bad = [role for role in parent_roles if role not in allowed_parents]
+        if bad:
+            return False, (
+                f"pipeline_contract_violation: {assignee} only accepts parents "
+                f"{sorted(allowed_parents)}; got {parent_roles}"
+            )
+        return True, "pipeline_parent_contract_pass"
+    created_by = task["created_by"] or ""
+    # Parentless tasks are allowed only for configured intake creators OR
+    # explicit role allowed_creators. This preserves small direct-entry
+    # exceptions while making the common non-intake path fail closed.
+    if created_by in allowed_creators:
+        return True, "creator_contract_pass"
+    if spec.get("intake") and created_by in allowed_creators:
+        return True, "intake_contract_pass"
+    return False, (
+        f"pipeline_contract_violation: parentless {assignee} created_by={created_by!r} "
+        f"not in allowed_creators {sorted(allowed_creators)}"
+    )
+
+
+def _block_contract_violation(
+    conn: sqlite3.Connection,
+    task_id: str,
+    reason: str,
+) -> None:
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status = 'blocked', claim_lock = NULL,
+                   claim_expires = NULL, worker_pid = NULL,
+                   last_failure_error = ?
+             WHERE id = ? AND status IN ('ready', 'running', 'review')
+            """,
+            (reason, task_id),
+        )
+        if cur.rowcount == 1:
+            run_id = _synthesize_ended_run(
+                conn, task_id, outcome="blocked", summary=reason,
+            )
+            _append_event(
+                conn, task_id, "contract_blocked",
+                {"reason": reason}, run_id=run_id,
+            )
+
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -5349,6 +5566,47 @@ def dispatch_once(
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
     stale_timeout_seconds: int = 0,
     board: Optional[str] = None,
+    default_assignee: Optional[str] = None,
+    max_in_progress_per_profile: Optional[int] = None,
+) -> DispatchResult:
+    """Run one coordinated dispatcher tick.
+
+    Gateway and cron dispatchers may both call this function. A per-board
+    advisory lock guarantees only one process runs the full reclaim/promote/
+    spawn cycle at a time.
+    """
+    with _dispatch_coordination_lock(conn) as acquired:
+        if not acquired:
+            result = DispatchResult()
+            result.dispatch_lock_busy = True
+            return result
+        return _dispatch_once_unlocked(
+            conn,
+            spawn_fn=spawn_fn,
+            ttl_seconds=ttl_seconds,
+            dry_run=dry_run,
+            max_spawn=max_spawn,
+            max_in_progress=max_in_progress,
+            failure_limit=failure_limit,
+            stale_timeout_seconds=stale_timeout_seconds,
+            board=board,
+            default_assignee=default_assignee,
+            max_in_progress_per_profile=max_in_progress_per_profile,
+        )
+
+def _dispatch_once_unlocked(
+    conn: sqlite3.Connection,
+    *,
+    spawn_fn=None,
+    ttl_seconds: Optional[int] = None,
+    dry_run: bool = False,
+    max_spawn: Optional[int] = None,
+    max_in_progress: Optional[int] = None,
+    failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
+    stale_timeout_seconds: int = 0,
+    board: Optional[str] = None,
+    default_assignee: Optional[str] = None,
+    max_in_progress_per_profile: Optional[int] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -5419,6 +5677,25 @@ def dispatch_once(
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
+
+    # Per-profile concurrency cap (#21582): prevent one profile's local model /
+    # API quota / browser pool from being overwhelmed by a fan-out while leaving
+    # other profiles idle. Tasks blocked this way go to skipped_per_profile_capped
+    # (not skipped_unassigned — the operator-actionable signal is different:
+    # "this profile is busy, try again later" not "this needs routing").
+    _per_profile_cap = max_in_progress_per_profile if (
+        isinstance(max_in_progress_per_profile, int)
+        and max_in_progress_per_profile > 0
+    ) else None
+    _per_profile_running: dict[str, int] = {}
+    if _per_profile_cap is not None:
+        for prow in conn.execute(
+            "SELECT assignee, COUNT(*) AS n FROM tasks "
+            "WHERE status = 'running' AND assignee IS NOT NULL "
+            "GROUP BY assignee"
+        ):
+            _per_profile_running[prow["assignee"]] = int(prow["n"])
+
     # Honour kanban.max_in_progress: if the board already has enough running
     # tasks, skip spawning this tick so slow workers (local LLMs,
     # resource-constrained hosts) can finish what they have before more tasks
@@ -5462,6 +5739,25 @@ def dispatch_once(
             # multi-lane setups where the ready queue is steadily full
             # of human-pulled work.
             result.skipped_nonspawnable.append(row["id"])
+            continue
+        # Per-profile concurrency cap (#21582): even if there's global
+        # headroom, refuse to spawn for an assignee that's already at
+        # its in-flight cap. Prevents one profile's local model / API
+        # quota / browser pool from being overwhelmed by a fan-out
+        # while the global max_in_progress / max_spawn caps still allow
+        # work on OTHER profiles.
+        if _per_profile_cap is not None:
+            current = _per_profile_running.get(row_assignee, 0)
+            if current >= _per_profile_cap:
+                result.skipped_per_profile_capped.append(
+                    (row["id"], row_assignee, current)
+                )
+                continue
+        contract_ok, contract_reason = check_pipeline_contract_for_task(conn, row["id"])
+        if not contract_ok:
+            result.contract_blocked.append((row["id"], contract_reason))
+            if not dry_run:
+                _block_contract_violation(conn, row["id"], contract_reason)
             continue
         # Respawn guard: refuse to re-spawn when useful work is already
         # in-flight/recent, or when the last failure is a deterministic
@@ -5562,6 +5858,12 @@ def dispatch_once(
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
+            continue
+        contract_ok, contract_reason = check_pipeline_contract_for_task(conn, row["id"])
+        if not contract_ok:
+            result.contract_blocked.append((row["id"], contract_reason))
+            if not dry_run:
+                _block_contract_violation(conn, row["id"], contract_reason)
             continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))

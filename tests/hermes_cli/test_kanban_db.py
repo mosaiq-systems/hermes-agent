@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import sqlite3
 import sys
@@ -1147,6 +1148,134 @@ def test_dispatch_skips_nonspawnable_into_separate_bucket(kanban_home, monkeypat
     assert t in res.skipped_nonspawnable
     assert t not in res.skipped_unassigned
     assert not res.spawned
+
+
+def _write_contracts(tmp_path, monkeypatch):
+    contracts = {
+        "pm": {
+            "allowed_parents": ["pm"],
+            "allowed_creators": ["user", "operator"],
+            "intake": True,
+        },
+        "software-engineer": {
+            "allowed_parents": ["architect", "tester", "reviewer", "qa", "escalation-gate"],
+            "allowed_creators": ["architect", "tester", "reviewer", "qa", "escalation-gate", "user", "operator"],
+            "intake": False,
+        },
+        "coder": {
+            "allowed_parents": ["software-engineer"],
+            "allowed_creators": ["software-engineer"],
+            "intake": False,
+        },
+        "senior-coder": {
+            "allowed_parents": ["software-engineer"],
+            "allowed_creators": ["software-engineer"],
+            "intake": False,
+        },
+        "tester": {
+            "allowed_parents": ["coder", "senior-coder"],
+            "allowed_creators": ["software-engineer"],
+            "intake": False,
+        },
+        "_overrides": {
+            "senior_coder_failed_to_pm": {
+                "allowed_parent_roles": ["software-engineer"],
+                "required_marker": "senior_coder_failed",
+            }
+        },
+    }
+    path = tmp_path / "pipeline-contracts.json"
+    path.write_text(json.dumps(contracts))
+    monkeypatch.setenv("HERMES_PIPELINE_CONTRACTS", str(path))
+    return path
+
+
+def test_dispatch_blocks_contract_violating_ready_task(
+    kanban_home, tmp_path, monkeypatch, all_assignees_spawnable
+):
+    _write_contracts(tmp_path, monkeypatch)
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="bad direct tester",
+            assignee="tester",
+            created_by="user",
+        )
+        res = kb.dispatch_once(conn)
+        task = kb.get_task(conn, task_id)
+    assert res.contract_blocked
+    assert res.contract_blocked[0][0] == task_id
+    assert task.status == "blocked"
+    assert not res.spawned
+
+
+def test_dispatch_allows_se_created_tester_with_coder_parent(
+    kanban_home, tmp_path, monkeypatch, all_assignees_spawnable
+):
+    _write_contracts(tmp_path, monkeypatch)
+    spawned = []
+
+    def fake_spawn(task, workspace):
+        spawned.append(task.id)
+
+    with kb.connect() as conn:
+        se = kb.create_task(conn, title="se", assignee="software-engineer", created_by="architect")
+        coder = kb.create_task(conn, title="coder", assignee="coder", created_by="software-engineer", parents=[se])
+        kb.complete_task(conn, se)
+        kb.complete_task(conn, coder)
+        tester = kb.create_task(
+            conn,
+            title="integration tester",
+            assignee="tester",
+            created_by="software-engineer",
+            parents=[coder],
+        )
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+    assert tester in spawned
+    assert not res.contract_blocked
+
+
+def test_dispatch_allows_senior_coder_failed_pm_override(
+    kanban_home, tmp_path, monkeypatch, all_assignees_spawnable
+):
+    _write_contracts(tmp_path, monkeypatch)
+    spawned = []
+
+    def fake_spawn(task, workspace):
+        spawned.append(task.id)
+
+    with kb.connect() as conn:
+        se = kb.create_task(conn, title="SE remediation", assignee="software-engineer", created_by="reviewer")
+        kb.complete_task(conn, se)
+        pm = kb.create_task(
+            conn,
+            title="senior_coder_failed: complete pipeline review",
+            body="senior_coder_failed after remediation; specs may be ambiguous",
+            assignee="pm",
+            created_by="software-engineer",
+            parents=[se],
+        )
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+    assert pm in spawned
+    assert not res.contract_blocked
+
+
+def test_dispatch_lock_reports_busy_without_spawning(
+    kanban_home, all_assignees_spawnable
+):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="locked", assignee="alice")
+        db_path = kb.kanban_db_path()
+        lock_path = db_path.with_suffix(db_path.suffix + ".dispatch.lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        import fcntl
+        with open(lock_path, "a+") as fh:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            res = kb.dispatch_once(conn)
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        assert res.dispatch_lock_busy is True
+        assert kb.get_task(conn, t).status == "ready"
+        assert not res.spawned
 
 
 def test_has_spawnable_ready_false_when_only_terminal_lanes(kanban_home, monkeypatch):
