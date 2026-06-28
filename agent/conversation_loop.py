@@ -853,6 +853,31 @@ def run_conversation(
             for idx, pfm in enumerate(agent.prefill_messages):
                 api_messages.insert(sys_offset + idx, pfm.copy())
 
+        # --- Kanban context injection (first API call only) ---
+        # Build worker context in Hermes layer instead of proxy.
+        # Only inject on the first API call for this task.
+        _task_id = os.environ.get("HERMES_KANBAN_TASK")
+        if _task_id and not getattr(agent, "_kanban_context_injected", False):
+            _db_path = os.environ.get("HERMES_KANBAN_DB") or ""
+            if _db_path:
+                try:
+                    from hermes_cli.kanban_db import build_worker_context
+                    import sqlite3 as _sql
+                    _conn = _sql.connect(f"file:{_db_path}?mode=ro", uri=True, timeout=5)
+                    try:
+                        _ctx = build_worker_context(_conn, _task_id)
+                        if _ctx:
+                            _sys_offset = 1 if (api_messages and api_messages[0].get("role") == "system") else 0
+                            api_messages.insert(_sys_offset, {
+                                "role": "system",
+                                "content": "[kanban-context]\n" + _ctx,
+                            })
+                    finally:
+                        _conn.close()
+                    agent._kanban_context_injected = True
+                except Exception as _exc:
+                    logger.warning("Kanban context injection failed: %s", _exc)
+
         # Apply Anthropic prompt caching for Claude models on native
         # Anthropic, OpenRouter, and third-party Anthropic-compatible
         # gateways. Auto-detected: if ``_use_prompt_caching`` is set,
