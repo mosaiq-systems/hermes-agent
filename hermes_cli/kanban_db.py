@@ -5758,6 +5758,13 @@ _RECENT_WORKER_EXIT_TTL_SECONDS = 600
 _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
 
+# Registry of live Popen handles for spawned workers.  _default_spawn
+# intentionally abandons the handle (the child keeps the log FD open),
+# but we stash a reference here so reap_worker_zombies can poll the
+# handle for exit status even after init (PID 1) has reaped the zombie.
+# Keyed by PID; entries are removed on first successful poll.
+_worker_handles: "dict[int, subprocess.Popen]" = {}
+
 
 def _record_worker_exit(pid: int, raw_status: int) -> None:
     """Record a reaped child's exit status for later classification.
@@ -5830,9 +5837,25 @@ def reap_worker_zombies() -> "list[int]":
 
     Returns the list of reaped PIDs. Safe to call when there are no
     children (returns []). No-op on Windows.
+
+    Drains the SIGCHLD handler's ``_pending_reaps`` buffer first, then
+    falls back to a direct ``waitpid`` loop.  The signal handler
+    captures exits before init (PID 1) can reap orphaned children
+    whose Popen handles were abandoned; the fallback loop catches
+    any zombies that arrive between dispatcher ticks.
     """
     reaped: "list[int]" = []
     if os.name != "nt":
+        # Drain signal-handler captures first.  Take a snapshot and
+        # clear so the handler can append to a fresh list while we
+        # process.  (GIL + main-thread execution make this safe.)
+        global _pending_reaps
+        if _pending_reaps:
+            pending = _pending_reaps
+            _pending_reaps = []
+            for pid, status in pending:
+                _record_worker_exit(pid, status)
+                reaped.append(pid)
         try:
             while True:
                 try:
@@ -5862,12 +5885,11 @@ def _pid_alive(pid: Optional[int]) -> bool:
 
     **Zombie handling:** the existence check succeeds against zombie
     processes (post-exit, pre-reap) because the process table entry
-    still exists. A worker that exits without being reaped by its
-    parent would stay "alive" to the dispatcher forever. Dispatcher
-    workers are started via ``start_new_session=True`` + intentional
-    Popen handle abandonment, so init reaps them quickly — but during
-    the window between exit and reap, we'd otherwise see stale "alive"
-    signals. On Linux we peek at ``/proc/<pid>/status`` and treat
+    still exists. A worker that exits without being reaped would stay
+    \"alive\" to the dispatcher forever. The SIGCHLD handler installed
+    at module load reaps zombies immediately (before init can reap
+    orphaned children), and ``reap_worker_zombies`` provides a
+    fallback for any zombies that arrive between dispatcher ticks.
     ``State: Z`` as dead. On macOS we ask ``ps`` for the BSD ``stat``
     field and treat values containing ``Z`` as dead.
     """
@@ -7808,6 +7830,16 @@ def _default_spawn(
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")
     try:
+        # Use process_group=0 instead of start_new_session=True:
+        # - process_group=0 creates a new process group (setpgid(0,0))
+        #   which isolates the worker from terminal signals (SIGINT)
+        #   while keeping the worker as a child of the dispatcher.
+        # - start_new_session=True (setsid) would create a new session,
+        #   causing init (PID 1) to reap the zombie before the
+        #   dispatcher's reap_worker_zombies() can capture the exit
+        #   code via waitpid(). That makes clean-exit protocol
+        #   violations indistinguishable from unknown crashes
+        #   (GitHub #1096).
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             cmd,
             cwd=workspace if os.path.isdir(workspace) else None,
@@ -7815,7 +7847,7 @@ def _default_spawn(
             stdout=log_f,
             stderr=subprocess.STDOUT,
             env=env,
-            start_new_session=True,
+            process_group=0 if not _IS_WINDOWS else None,
             creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
         )
     except FileNotFoundError:
