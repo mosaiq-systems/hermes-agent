@@ -77,6 +77,7 @@ import os
 import re
 import random
 import secrets
+import signal
 import shutil
 import sqlite3
 import subprocess
@@ -5764,6 +5765,47 @@ _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
 # handle for exit status even after init (PID 1) has reaped the zombie.
 # Keyed by PID; entries are removed on first successful poll.
 _worker_handles: "dict[int, subprocess.Popen]" = {}
+
+# Pending reaps captured by the SIGCHLD handler but not yet
+# processed by reap_worker_zombies.  List of (pid, status) tuples.
+_pending_reaps: list = []
+
+
+def _sigchld_handler(signum: int, frame: object) -> None:
+    """Reap children in the signal handler before init can claim them.
+
+    The dispatcher runs a *main-thread* event loop: ``dispatch_once``
+    calls ``reap_worker_zombies()`` which drains ``_pending_reaps`` first.
+    Between dispatcher ticks, the SIGCHLD handler captures any child
+    exits and appends ``(pid, status)`` tuples to ``_pending_reaps``.
+    Because both the handler and the drainer run in the main thread
+    (Python delivers signals to the main thread), there is no
+    concurrent mutation — the GIL + main-thread execution make this safe.
+
+    The handler does its own ``waitpid(WUNTRACED|WNOHANG)`` loop so
+    **every** child is accounted for: a child that exits between a
+    dispatcher tick and the next dispatch can never become a zombie
+    that init reaps without us knowing its exit status.
+
+    Platform note: SIGCHLD is POSIX-only. The signal is never
+    registered on Windows, so this handler is dead code there.
+    """
+    try:
+        while True:
+            try:
+                pid, status = os.waitpid(-1, os.WNOHANG)
+            except ChildProcessError:
+                break
+            if pid == 0:
+                break
+            _pending_reaps.append((pid, status))
+    except Exception:
+        # Best-effort: never let a handler crash take down the process.
+        pass
+
+
+if os.name != "nt":
+    signal.signal(signal.SIGCHLD, _sigchld_handler)
 
 
 def _record_worker_exit(pid: int, raw_status: int) -> None:
