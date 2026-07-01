@@ -5758,6 +5758,21 @@ _RECENT_WORKER_EXIT_TTL_SECONDS = 600
 _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
 
+# Registry of active worker Popen handles, populated by ``_default_spawn``
+# and consulted by ``_poll_worker_handle`` / ``_classify_worker_exit``.
+# When the reap loop (``reap_worker_zombies``) fails to capture an exit
+# because init reaped the zombie first (the Popen handle was intentionally
+# abandoned; the dispatcher is not the child's only reaper on systems where
+# a subreaper or PID-1 init competes), this registry lets us still recover
+# the exit code by polling the stored Popen handle.
+#
+# Entry: ``pid -> subprocess.Popen``. Entries are cleaned up lazily when
+# ``_poll_worker_handle`` finds the process has exited, and also aged out
+# during dispatch ticks via ``_cleanup_stale_popen_handles``.
+_ACTIVE_WORKER_POPEN_TTL_SECONDS = 3600  # 1 hour — long enough for any worker run
+_ACTIVE_WORKER_POPENS_MAX = 1024
+_active_worker_popens: "dict[int, object]" = {}
+
 
 def _record_worker_exit(pid: int, raw_status: int) -> None:
     """Record a reaped child's exit status for later classification.
@@ -5780,6 +5795,80 @@ def _record_worker_exit(pid: int, raw_status: int) -> None:
         ordered = sorted(_recent_worker_exits.items(), key=lambda kv: kv[1][1])
         for _pid, _ in ordered[: len(ordered) // 2]:
             _recent_worker_exits.pop(_pid, None)
+
+
+def _register_worker_popen(pid: int, proc: object) -> None:
+    """Register a Popen handle for later exit-code recovery.
+
+    Called from ``_default_spawn`` after spawning a worker. The handle
+    is stored so ``_poll_worker_handle`` can recover the exit code even
+    after init or a subreaper has reaped the zombie before the dispatcher's
+    ``reap_worker_zombies`` loop gets to it.
+    """
+    if not pid or pid <= 0:
+        return
+    _active_worker_popens[int(pid)] = proc
+    # Trim if over cap: drop oldest entries (we don't track timestamps
+    # per-entry, so we just drop in insertion order — Python 3.7+ dicts
+    # preserve insertion order).
+    if len(_active_worker_popens) > _ACTIVE_WORKER_POPENS_MAX:
+        # Drop oldest half.
+        surplus = len(_active_worker_popens) - (_ACTIVE_WORKER_POPENS_MAX // 2)
+        keys_to_drop = list(_active_worker_popens.keys())[:surplus]
+        for k in keys_to_drop:
+            _active_worker_popens.pop(k, None)
+
+
+def _poll_worker_handle(pid: int) -> Optional[int]:
+    """Poll a stored Popen handle and record its exit in the reap registry.
+
+    Returns the raw wait status if the process has exited, or None if
+    it's still running. On POSIX the raw status is compatible with
+    ``os.WIFEXITED`` / ``os.WEXITSTATUS`` / ``os.WIFSIGNALED``.
+
+    When the process has exited, the result is also recorded in
+    ``_recent_worker_exits`` so ``_classify_worker_exit`` can classify
+    it, and the Popen handle is removed from ``_active_worker_popens``.
+    """
+    proc = _active_worker_popens.get(int(pid))
+    if proc is None:
+        return None
+    try:
+        returncode = proc.poll()
+    except Exception:
+        returncode = None
+    if returncode is not None:
+        # Process has exited — record in the reap registry and clean up.
+        # Popen.returncode is the processed exit code: positive for normal
+        # exit (e.g. 0, 1, 75), negative for signal death (e.g. -9 for
+        # SIGKILL).  Convert to raw wait-status format so _classify_worker_exit
+        # can use os.WIFEXITED / os.WIFSIGNALED:
+        #   - Normal exit:  raw = exit_code << 8  (lower 7 bits = 0)
+        #   - Signaled:     raw = -returncode      (lower 7 bits = signal)
+        if returncode >= 0:
+            raw_status = returncode << 8
+        else:
+            raw_status = -returncode
+        _record_worker_exit(int(pid), raw_status)
+        _active_worker_popens.pop(int(pid), None)
+        return raw_status
+    return None
+
+
+def _cleanup_stale_popen_handles(now: Optional[float] = None) -> int:
+    """Remove Popen handles whose worker process is no longer alive.
+
+    Called once per dispatch tick to prevent unbounded growth.
+    Returns the number of entries removed.
+    """
+    cleaned = 0
+    for pid in list(_active_worker_popens.keys()):
+        if not _pid_alive(pid):
+            # Process is dead but we haven't polled yet — poll now
+            # to capture the exit code before removing.
+            _poll_worker_handle(pid)
+            cleaned += 1
+    return cleaned
 
 
 def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
@@ -5806,6 +5895,10 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     ``nonzero_exit``) or the signal number (for ``signaled``), or ``None``
     for ``unknown``.
     """
+    # Before falling through to the reap registry, check the Popen handle
+    # registry — the worker may have been reaped by init/subreaper before
+    # reap_worker_zombies could capture the exit.
+    _poll_worker_handle(pid)
     entry = _recent_worker_exits.get(int(pid))
     if entry is None:
         return ("unknown", None)
@@ -7040,6 +7133,10 @@ def _dispatch_once_locked(
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
     reap_worker_zombies()
+    # Clean up Popen handles for workers that have already exited but
+    # whose exit was not captured by reap_worker_zombies (init/subreaper
+    # beat us to the reap). Polls the stored handles to recover exit codes.
+    _cleanup_stale_popen_handles()
 
     result = DispatchResult()
     result.reclaimed = release_stale_claims(conn)
@@ -7829,6 +7926,7 @@ def _default_spawn(
     # handle is kept alive by the child's inheritance.  The parent's
     # reference goes out of scope and is GC'd, but the OS-level FD stays
     # open in the child until the child exits.
+    _register_worker_popen(proc.pid, proc)
     return proc.pid
 
 
